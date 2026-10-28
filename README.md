@@ -4,6 +4,8 @@
 
 支持直连（forward）和反向隧道（reverse）。下文 A 为运行脚本的机器，B 为中转机，客户端为执行登录命令的电脑。示例用户名和地址均需替换。
 
+默认在前台持续运行，Python 管理 `sshd` 和反向隧道 `ssh` 的生命周期，不会自行转入后台。需要后台运行时可自行使用 tmux 或 nohup。
+
 ## 环境要求与下载
 
 需要 Linux、Python 3.7+ 和 OpenSSH（`sshd`、`ssh`、`ssh-keygen`、`ssh-keyscan`）；reverse 模式的客户端需支持 `ssh -J`。
@@ -18,12 +20,13 @@ reverse 需要交互输入，请下载后执行，不要使用 `curl ... | pytho
 ## 用法
 
 ```text
-python3 ssh-serve.py [-h] [-u USER] [-k KEY] [-d DIR] [-m MODE] [-p PORT]
+python3 ssh-serve.py [-h] [-v] [-u USER] [-k KEY] [-d DIR] [-m MODE] [-p PORT]
 ```
 
 | 参数 | 说明 |
 | --- | --- |
 | `-h`、`--help` | 显示帮助并退出 |
+| `-v`、`--version` | 显示版本号并退出 |
 | `-u`、`--user` | 登录 A 的用户，默认是运行脚本的有效用户；普通用户只能指定自己 |
 | `-k`、`--key` | 登录 A 的公钥，或 `@/path/key.pub`；可重复 |
 | `-d`、`--dir` | 专用目录，默认 `/tmp/extra-sshd` |
@@ -114,7 +117,7 @@ ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes \
 
 ## 日志、停止与再次启动
 
-默认目录 `/tmp/extra-sshd` 保存配置和日志，`state.json` 记录 PID、模式和端口。
+默认目录 `/tmp/extra-sshd` 保存配置和日志，`state.json` 记录 Python、sshd、隧道（reverse 模式）的 PID、模式和端口。这是启动信息快照，不能用来判断服务是否仍在运行。
 
 查看日志：
 
@@ -122,12 +125,22 @@ ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes \
 tail -n 50 /tmp/extra-sshd/sshd.log
 ```
 
-停止时，使用启动输出中的实际 PID：
+在前台按 `Ctrl+C` 停止，或使用启动输出中的 Python PID：
 
 ```bash
-kill <服务PID>
+kill <Python PID>
 ```
 
-reverse 还需执行输出的“停止隧道”命令。sudo 启动的服务需相应权限才能停止。
+Python 退出会同时停止本次启动的 sshd 和反向隧道；任一服务异常退出也会停止另一服务。Linux 父进程死亡信号确保即使 Python 被 `kill -9`，这两个直接子进程也会被内核终止。sudo 启动的服务需相应权限才能停止。
+
+这管理的是监听服务和隧道进程；已登录 SSH 会话中另行创建或脱离的进程不属于这一保证。
+
+需要后台运行时，例如：
+
+```bash
+tmux new -s extra-sshd 'python3 ssh-serve.py'
+# 或用于无需交互的 forward 模式
+nohup python3 ssh-serve.py >extra-sshd.out 2>&1 &
+```
 
 再次启动前先停止同目录的服务与隧道，或用不同的 `-d` 目录。停止不会删除密钥，再次启动会复用密钥和授权；需长期保留时，选择 `/tmp` 以外的专用目录。

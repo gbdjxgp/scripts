@@ -4,6 +4,7 @@
 reverse 模式把端口绑定到 B 的 127.0.0.1，通过 ssh -J 访问。
 """
 import argparse
+import ctypes
 import fcntl
 import json
 import os
@@ -12,12 +13,47 @@ import pwd
 import re
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+
+VERSION = '1.1.0'
+
+
+def start_managed(cmd, **kwargs):
+    """Linux：即使 Python 被 SIGKILL，直接子进程也由内核终止。
+
+    本脚本为单线程；preexec_fn 中只设置 prctl 并检查 fork/父进程退出竞态。
+    """
+    parent = os.getpid()
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    def bind_parent():
+        if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+            os._exit(127)
+        if os.getppid() != parent:
+            os._exit(127)
+
+    return subprocess.Popen(cmd, preexec_fn=bind_parent, **kwargs)
+
+
+def stop_managed(process):
+    if process is not None:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        process.wait()
+
+
+def handle_signal(signum, frame):
+    raise SystemExit(128 + signum)
 
 
 def fail(message):
@@ -71,6 +107,7 @@ def parse_mode(value):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('-v', '--version', action='version', version='%(prog)s ' + VERSION)
     p.add_argument('-u', '--user', default=pwd.getpwuid(os.geteuid()).pw_name,
                    help='A 的登录用户，默认当前有效用户；非 root 不能指定其他用户')
     p.add_argument('-k', '--key', action='append', default=[],
@@ -192,7 +229,13 @@ def main():
             pass
     sockpath = directory / 'reverse.sock'
     if sockpath.exists():
-        fail('已有反向隧道控制 socket；请先停止旧隧道，或换 -d 目录。')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+            try:
+                control.connect(str(sockpath))
+            except ConnectionRefusedError:
+                sockpath.unlink()  # SIGKILL 后留下的失效 socket。
+            else:
+                fail('已有反向隧道控制 socket；请先停止旧隧道，或换 -d 目录。')
     if args.mode and len(os.fsencode(str(sockpath))) > 90:
         fail('反向模式目录太长，Unix socket 路径请控制在 90 字节以内。')
     host = directory / 'host_ed25519'
@@ -240,13 +283,13 @@ def main():
     if checked.returncode:
         fail('sshd 配置检查失败：\n' + checked.stderr)
     process = None
-    master = None
+    tunnel = None
     try:
         logfile = directory / 'sshd.log'
         with open(str(logfile), 'ab') as log:
-            process = subprocess.Popen([sshd, '-D', '-e', '-f', str(config)],
+            process = start_managed([sshd, '-D', '-e', '-f', str(config)],
                                        stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                       start_new_session=True, close_fds=True)
+                                       close_fds=True)
         for _ in range(40):
             time.sleep(0.1)
             if process.poll() is not None:
@@ -260,7 +303,8 @@ def main():
                                capture_output=True, text=True, timeout=8)
         if probe.returncode or not probe.stdout.strip():
             fail('SSH 握手检查失败（可能是容器/系统权限限制）：\n' + logfile.read_text()[-4000:])
-        state = {'sshd_pid': process.pid, 'a_user': args.user, 'a_port': port, 'mode': 'forward'}
+        state = {'python_pid': os.getpid(), 'sshd_pid': process.pid,
+                 'a_user': args.user, 'a_port': port, 'mode': 'forward'}
         print('本机登录密钥（按目录内容生成或复用）：' + str(login_key))
         identity = ['/你的/客户端私钥']
         if generated_client:
@@ -299,7 +343,14 @@ def main():
                 print('首次 B 主机指纹采用 TOFU；若已有指纹不匹配将拒绝连接。')
             master = base + ['-S', str(sockpath)]
             # 先交互认证，再通过 control socket 分配 B 的端口；0 由 B 操作系统分配。
-            run(master + ['-M', '-f', '-N', '-T', dest])
+            tunnel = start_managed(master + ['-M', '-N', '-T', dest])
+            # 密码认证可能需要较长时间；不限制用户输入时间。
+            while not sockpath.exists():
+                if tunnel.poll() is not None:
+                    fail('反向隧道启动失败，退出码：%d' % tunnel.returncode)
+                if process.poll() is not None:
+                    fail('sshd 在建立隧道时退出。')
+                time.sleep(0.1)
             requested = args.port or 0
             spec = '127.0.0.1:%d:127.0.0.1:%d' % (requested, port)
             forwarded = run(master + ['-O', 'forward', '-o', 'ExitOnForwardFailure=yes', '-R', spec, dest],
@@ -314,33 +365,46 @@ def main():
             jump = '%s@%s:%d' % (buser, jump_host, bport)
             final += ['-J', jump, '-p', str(exposed), args.user + '@127.0.0.1']
             state.update(mode='reverse', b_user=buser, b_host=bhost, b_ssh_port=bport,
-                         b_port=exposed, control_socket=str(sockpath))
+                         b_port=exposed, control_socket=str(sockpath), tunnel_pid=tunnel.pid)
             print('\nB 监听：127.0.0.1:%d -> A 127.0.0.1:%d' % (exposed, port))
             print('客户端还需能登录 B；A→B 的隧道密钥不会自动授权客户端→B。')
-            print('停止隧道：' + command(master + ['-O', 'exit', dest]))
         atomic_write(directory / 'state.json', json.dumps(state, ensure_ascii=False, indent=2) + '\n')
         print('\n访问命令（在客户端执行；-i 替换为对应私钥路径）：\n' + command(final))
         print('A 主机指纹：', flush=True)
         run([keygen, '-l', '-f', str(host) + '.pub'])
-        print('A 服务 PID：%d；停止：kill %d' % (process.pid, process.pid))
+        print('Python PID：%d；A 服务 PID：%d；停止：Ctrl+C 或 kill %d' %
+              (os.getpid(), process.pid, os.getpid()))
         print('日志：' + str(logfile))
         print('状态：' + str(directory / 'state.json'))
-        print('不会修改 .ssh、系统 SSH 配置或设置开机自启。')
-    except BaseException:
-        if master:
-            subprocess.run(master + ['-O', 'exit', dest], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-        raise
+        print('前台运行中；不会修改 .ssh、系统 SSH 配置或设置开机自启。', flush=True)
+        while True:
+            if process.poll() is not None:
+                fail('sshd 已退出，退出码：%d' % process.returncode)
+            if tunnel is not None and tunnel.poll() is not None:
+                fail('反向隧道已退出，退出码：%d' % tunnel.returncode)
+            time.sleep(0.2)
+    finally:
+        stop_managed(tunnel)
+        stop_managed(process)
+        if process is not None:
+            unlink_if_exists(pidfile)
+        if tunnel is not None:
+            unlink_if_exists(sockpath)
+
+
+def unlink_if_exists(path):
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 if __name__ == '__main__':
     os.umask(0o077)
+    signal.signal(signal.SIGTERM, handle_signal)
+    # nohup 继承的 SIGHUP=SIG_IGN 必须保留。
+    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, handle_signal)
     try:
         main()
     except KeyboardInterrupt:
